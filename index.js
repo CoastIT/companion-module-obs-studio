@@ -52,6 +52,7 @@ instance.prototype.init = function () {
 	var self = this
 	self.stopStatsPoller()
 	self.stopMediaPoller()
+	self.stopMediaStatsPoller()
 	self.init_presets()
 	self.init_variables()
 	self.init_feedbacks()
@@ -121,6 +122,7 @@ instance.prototype.init = function () {
 				self.updateSourceAudio()
 				self.updateMediaSources()
 				self.startMediaPoller()
+				self.startMediaStatsPoller()
 			})
 			.catch((err) => {
 				self.status(self.STATUS_ERROR, err)
@@ -1046,6 +1048,64 @@ instance.prototype.stopMediaPoller = function () {
 	}
 }
 
+instance.prototype.startMediaStatsPoller = function() {
+	this.stopMediaStatsPoller()
+	let self = this
+	this.mediaStatsPoller = setInterval(() => {
+		self.updateMediaStats()
+		self.checkFeedbacks('media_source_remaining_time');
+		self.init_variables()		
+	}, 1000)
+}
+
+instance.prototype.stopMediaStatsPoller = function() {
+	if (this.mediaStatsPoller) {
+		clearInterval(this.mediaStatsPoller)
+		this.mediaStatsPoller = null
+	}
+}
+
+instance.prototype.updateMediaStats = async function () {
+	var self = this
+	//self.log('debug', 'updateMediaStats()');
+	let mediaSources = await self.obs.send('GetMediaSourcesList');
+	if (!self.states.mediaSources) self.states.mediaSources = {}; // create states object for media sources
+
+	for (let mediaSource of mediaSources['mediaSources']) {
+		let sourceName = mediaSource.sourceName;
+		if (!self.states.mediaSources[sourceName]) self.states.mediaSources[sourceName] = {}; // create the states object for the media source
+		self.states.mediaSources[sourceName].sourceName = sourceName;
+		self.states.mediaSources[sourceName].mediaState = mediaSource.mediaState;
+
+		if ( mediaSource.mediaState === 'playing' || mediaSource.mediaState === 'paused' ) {
+			let mediaDuration = await self.obs.send('GetMediaDuration', {'sourceName': sourceName});
+			let mediaTime = await self.obs.send('GetMediaTime', {'sourceName': sourceName});
+			let remainingTime = mediaDuration.mediaDuration - mediaTime.timestamp; // time in ms
+
+			let remainingTime_s = remainingTime / 1000;
+			let h = Math.floor(remainingTime_s / 3600);
+			let hh = ('00' + h).slice(-2);
+			let m = Math.floor(remainingTime_s / 60) % 60;
+			let mm = ('00' + m).slice(-2);
+			let s = Math.floor(remainingTime_s % 60);
+			let ss = ('00' + s).slice(-2);
+			let remainingTime_hhmmss = hh + ':' + mm + ':' + ss;
+
+			//self.log('debug', 'PLAYING: ' + sourceName + ', remainingTime: ' + remainingTime_hhmmss + ' (' + remainingTime + ')');
+
+			self.states.mediaSources[sourceName].remainingTime = remainingTime;
+			self.setVariable('src_remaining_time_s_' + sourceName, Math.floor(remainingTime_s));
+			self.states.mediaSources[sourceName].remainingTime_hhmmss = remainingTime_hhmmss;
+			self.setVariable('src_remaining_time_' + sourceName, remainingTime_hhmmss);
+		} else {
+			self.states.mediaSources[sourceName].remainingTime = '';
+			self.setVariable('src_remaining_time_s_' + sourceName, '');
+			self.states.mediaSources[sourceName].remainingTime_hhmmss = '';
+			self.setVariable('src_remaining_time_' + sourceName, '');
+		}
+	}
+}
+
 instance.prototype.updateTextSources = function (source, typeId) {
 	var self = this
 	if (typeId === 'text_ft2_source_v2') {
@@ -1112,6 +1172,7 @@ instance.prototype.destroy = function () {
 	self.authenticated = null
 	self.stopStatsPoller()
 	self.stopMediaPoller()
+	self.stopMediaStatsPoller()
 }
 
 instance.prototype.actions = function () {
@@ -2527,6 +2588,36 @@ instance.prototype.init_feedbacks = function () {
 	var self = this
 
 	var feedbacks = {}
+
+	feedbacks['media_source_remaining_time'] = {
+		type: 'boolean',
+		label: 'Change colors on media source remaining time',
+		description: 'Change colors when remaining time of a media source is below a threshold',
+		style: {
+			color: self.rgb(0, 0, 0),
+			bgcolor: self.rgb(255, 0, 0),
+		},
+		options: [
+			{
+				type: 'dropdown',
+				label: 'Source name',
+				id: 'source',
+				default: self.sourcelistDefault,
+				choices: self.sourcelist,
+				minChoicesForSearch: 5
+			},
+			{
+				type: 'number',
+				label: 'Remaining time threshold (in seconds)',
+				id: 'rtThreshold',
+				default: 20,
+				min: 0,
+				max: 3600, //max is required by api
+				range: false,
+			},
+		],
+	}
+
 	feedbacks['streaming'] = {
 		type: 'boolean',
 		label: 'Streaming Active',
@@ -2922,6 +3013,22 @@ instance.prototype.feedback = function (feedback) {
 
 	if (self.states === undefined) {
 		return
+	}
+
+	if (feedback.type === 'media_source_remaining_time') {
+		let sourceName = feedback.options.source;
+		if ( self.states.mediaSources && self.states.mediaSources[sourceName] ) {
+			let remainingTime = self.states.mediaSources[sourceName].remainingTime;
+			if (remainingTime) {
+				let remainingTime_s = Math.round(remainingTime / 1000);
+				if ( remainingTime_s <= feedback.options.rtThreshold) {
+					// TODO: find a better way to implement button blinking, with configurable blinking frequence
+					if ( remainingTime_s % 2 == 0) {  // flash in seconds interval (mediaStatsPoller interval)
+						return true;
+					}
+				}
+			}
+		}
 	}
 
 	if (feedback.type === 'scene_active') {
@@ -3541,6 +3648,14 @@ instance.prototype.init_variables = function () {
 			variables.push({ name: 'image_file_name_' + source.name, label: 'Image file name for ' + source.name })
 		}
 		variables.push({ name: 'volume_' + source.name, label: 'Current volume for ' + source.name })
+	}
+
+	if (self.states && self.states.mediaSources) {
+		for (var mediaSource in self.states.mediaSources) {
+			let sourceName = self.states.mediaSources[mediaSource].sourceName;
+			variables.push({ name: 'src_remaining_time_' + sourceName, label: 'Remaining time in hhmmss for media source ' + sourceName})
+			variables.push({ name: 'src_remaining_time_s_' + sourceName, label: 'Remaining time in seconds for media source ' + sourceName})
+		}
 	}
 
 	self.setVariableDefinitions(variables)
